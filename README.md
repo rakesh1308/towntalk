@@ -1,6 +1,6 @@
 # LocUp — On-device text classification on Android
 
-> A hyperlocal social feed that classifies every post **on-device** with
+> A hyperlocal social feed that classifies every post on-device with
 > TensorFlow Lite. No servers, no API keys, no Play Services.
 
 ![Android](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)
@@ -11,7 +11,7 @@
 
 ## What it is
 
-LocUp is a small Android MVP that explores one idea: *can a
+LocUp is a tiny Android MVP that explores one idea: *can a
 neighbourhood social feed classify its own posts — Emergency / Traffic
 / Event / Civic / General — without ever calling a server?*
 
@@ -27,48 +27,49 @@ stays demoable on any device.
 
 ---
 
-## Architecture
+## Approach — local model inference, end to end
 
 ```mermaid
 flowchart LR
-    User([User]) -->|types post| Compose[ComposeSheet<br/>Material 3 BottomSheet]
-    User -->|grants location| AOSP[AOSP LocationManager]
+    subgraph Build["Build pipeline (Colab)"]
+        CSV[train.csv<br/>train / test split] --> V[Vocabulary<br/>top 3000 tokens]
+        V --> E[Encoder<br/>token -> IntArray SEQ_LEN=24]
+        E --> K[Keras model<br/>Embedding + Pool + Dense]
+        K --> C[TFLiteConverter]
+        C --> A1[locup_text_classifier.tflite]
+        C --> A2[vocab.json]
+        C --> A3[labels.txt]
+    end
 
-    Compose -->|text| Repo[PostClassifierRepository]
-    AOSP -->|last fix| Loc[LocationProvider]
-    Loc -->|lat/lon grid cell| Compose
+    subgraph Ship["Shipped in the APK"]
+        A1 --> Assets[(app/src/main/assets/)]
+        A2 --> Assets
+        A3 --> Assets
+    end
 
-    Repo -->|assets present| TFLite[TfliteTextClassifier<br/>tokenize + Interpreter.run]
-    Repo -->|assets missing| Fallback[LocalClassifier<br/>KeywordFallback.score]
+    subgraph Runtime["On-device inference (Android)"]
+        Compose[ComposeSheet<br/>live keystroke] --> Tok[Kotlin tokenize<br/>mirrors Python regex]
+        Assets -->|memory-mapped<br/>FileChannel.map| TFLite[Interpreter]
+        Tok --> Enc[Kotlin encode<br/>vocab lookup, OOV=1, PAD=0]
+        Enc --> TFLite
+        TFLite --> Out[FloatArray labels.size<br/>softmax]
+        Out --> Bars[Live probability bars]
+    end
 
-    TFLite --> Result[ClassificationResult<br/>label + scores]
-    Fallback --> Result
-    Result -->|live bars| Compose
-
-    Compose -->|publish| Posts[(Room:<br/>posts + subscriptions)]
-    Loc -->|lat/lon| Cluster[Cluster.idFor<br/>~1 km grid]
-    Cluster --> Posts
+    Bars -.fallback if assets missing.-> KW[KeywordFallback.score]
 ```
 
-UI thread never touches the interpreter directly — `PostClassifierRepository`
-is the single entry point, owned by `MainActivity`, threaded down to
-`LocUpApp.kt`. No DI framework, no Hilt, no Firebase.
+**Plain Python on the build side, plain `Interpreter` on the device
+side — no Task Library, no MediaPipe, no bundled tokenizer metadata.**
+
+The model side intentionally **tokenizes outside the graph** (custom
+Keras `Embedding` + `GlobalAveragePooling1D` + `Dense`). That keeps
+the TFLite graph to standard ops only, which is what makes the
+conversion and on-device run trouble-free.
 
 ---
 
-## How the local TensorFlow model was built
-
-### 1. Tooling
-
-Started with `tflite-model-maker` (MobileBERT) → broken dependency pin
-on current Colab. Switched to `mediapipe-model-maker` → installed but
-collapsed on a `pyyaml`/`Cython`/`numpy` chain three layers deep.
-Abandoned both Model Maker libraries.
-
-Built the model from scratch with **plain `tensorflow` / `keras`** —
-already preinstalled in Colab, zero extra `pip install` calls.
-
-### 2. Vocabulary — built only from `train.csv`
+## Build the model
 
 ```python
 def tokenize(text):
@@ -78,27 +79,17 @@ counter = Counter()
 for t in train_texts:
     counter.update(tokenize(t))
 
-most_common = [w for w, _ in counter.most_common(VOCAB_SIZE - 2)]  # top 3000
+most_common = [w for w, _ in counter.most_common(VOCAB_SIZE - 2)]
 word_to_idx = {"<PAD>": 0, "<OOV>": 1}
 for i, w in enumerate(most_common):
     word_to_idx[w] = i + 2
-```
 
-Test data is never seen during vocab construction.
-
-### 3. Encoding to a fixed-length integer array
-
-```python
 def encode(text):
     tokens = tokenize(text)[:SEQ_LEN]                # SEQ_LEN = 24
     ids = [word_to_idx.get(t, 1) for t in tokens]     # 1 = OOV
     ids += [0] * (SEQ_LEN - len(ids))                 # 0 = PAD
     return ids
-```
 
-### 4. Model architecture
-
-```python
 model = keras.Sequential([
     keras.layers.Input(shape=(SEQ_LEN,), dtype=tf.int32),
     keras.layers.Embedding(input_dim=VOCAB_SIZE, output_dim=48),
@@ -110,85 +101,25 @@ model = keras.Sequential([
 model.compile(optimizer='adam',
               loss='sparse_categorical_crossentropy',
               metrics=['accuracy'])
-model.fit(X_train, y_train,
-          validation_data=(X_test, y_test),
+model.fit(X_train, y_train, validation_data=(X_test, y_test),
           epochs=25, batch_size=32)
-```
 
-Standard ops only — embedding, pooling, dense — no custom or
-text-processing ops in the graph. **Tokenization happens outside the
-model entirely**, which is what made the TFLite conversion
-trouble-free where the BERT paths kept failing.
-
-### 5. Conversion to TFLite
-
-```python
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 tflite_model = converter.convert()
 ```
 
-### 6. Shipped artifacts (3 files, dropped into `app/src/main/assets/`)
-
-- `locup_text_classifier.tflite` — the converted model (579 KB)
-- `vocab.json` — the `word_to_idx` map, dumped as-is
-- `labels.txt` — the 5 label names, in the same order as the model's
-  output layer (`idx_to_label`)
-
-### 7. Verified before shipping
-
-Ran the exported `.tflite` (not the in-memory Keras model) through
-`tf.lite.Interpreter` directly against real sentences, to confirm the
-**actual shipped file** behaves correctly — not just the pre-export
-version.
-
-End-to-end pipeline:
-
-```
-CSV → vocab/encoding → Keras training → TFLiteConverter → 3 assets in APK
-```
+Drop the three artefacts into `app/src/main/assets/` and the app
+picks them up. The same `regex` and `SEQ_LEN` shape are
+re-implemented in Kotlin so the device sees input in the exact
+shape the model was trained on.
 
 ---
 
-## How TensorFlow Lite is wired into the Android app
+## Run inference on the device
 
-### 1. Dependency
-
-Plain TFLite runtime — no Task Library, no MediaPipe Tasks (both expect
-BERT-style embedded tokenizer metadata that the word-embedding model
-doesn't produce):
-
-```kotlin
-implementation("org.tensorflow:tensorflow-lite:2.14.0")
-```
-
-### 2. Assets in the APK
-
-Three files in `app/src/main/assets/`, all produced by the Colab notebook:
-
-- `locup_text_classifier.tflite` — the model
-- `vocab.json` — word → index map (578 entries)
-- `labels.txt` — the 5 labels, in model output order
-
-### 3. Loading the model
-
-`TfliteTextClassifier` is `lazy` and tries to load all three via
-`context.assets`:
-
-- **Model** — `context.assets.openFd()` → `FileInputStream` →
-  `FileChannel.map()` into a `MappedByteBuffer`, then `Interpreter(buffer)`.
-- **Vocab** — read `vocab.json` as text, parse with `org.json.JSONObject`
-  into a `Map<String, Int>`.
-- **Labels** — read `labels.txt` line by line into a `List<String>`.
-
-Wrapped in a `try/catch` that returns `null` on any failure (missing
-asset, malformed file) rather than throwing — that's what
-`isModelAvailable` checks.
-
-### 4. Tokenising on-device
-
-The critical piece: **Kotlin re-implements the exact same logic as the
-Python training code**, so the model sees input in the same shape it
-was trained on.
+`PostClassifierRepository` is the single entry point. It owns
+`TfliteTextClassifier` (real model) and `LocalClassifier` (keyword
+fallback) and picks at call time.
 
 ```kotlin
 private val TOKEN_REGEX = Regex("[a-zA-Z0-9']+")
@@ -202,31 +133,17 @@ fun encode(text: String, vocab: Map<String, Int>): IntArray {
     tokens.forEachIndexed { i, t -> ids[i] = vocab[t] ?: OOV_INDEX }  // 1 = OOV
     return ids
 }
-```
 
-### 5. Running inference
-
-```kotlin
-val input  = Array(1) { inputIds }                  // shape [1, 24]
-val output = Array(1) { FloatArray(labels.size) }   // shape [1, 5]
+val input  = Array(1) { inputIds }                  // [1, 24]
+val output = Array(1) { FloatArray(labels.size) }   // [1, 5]
 interpreter.run(input, output)
 ```
 
-Plain `Interpreter.run()` — no preprocessing / postprocessing helpers,
-since there's no bundled metadata to drive them.
-
-### 6. Exposing results
-
-Output floats zipped with label names into `LabelScore(label, score)`,
-sorted descending — that's the live probability distribution shown as
-the user types.
-
-### 7. Fallback wiring
-
-`PostClassifierRepository` sits in front of `TfliteTextClassifier`:
-checks `isModelAvailable` first, uses the real model if present,
-otherwise falls back to the existing keyword scorer — so the app stays
-demoable even without the `.tflite` asset bundled.
+Loading uses `context.assets.openFd()` → `FileChannel.map()` → a
+memory-mapped `MappedByteBuffer`, so first-inference start-up is
+essentially free. If any of the three assets is missing the model
+returns `null` from `tryLoad()` and the repository falls back to the
+keyword scorer — banner turns green when the real path is active.
 
 ---
 
@@ -242,15 +159,13 @@ demoable even without the `.tflite` asset bundled.
 
 **AI / ML**
 
-- End-to-end on-device text classification — CSV → TFLite → APK
-- Custom Keras word-embedding model (Embedding + Pooling + Dense)
-  trained in Colab with **plain `tensorflow`/`keras`** after Model Maker
-  paths failed
-- TFLite conversion with **standard ops only** — no custom or
-  text-processing ops in the graph
+- End-to-end on-device text classification — CSV → Keras → TFLite →
+  APK assets → in-app `Interpreter`
+- Custom Keras word-embedding model (Embedding + Pool + Dense),
+  standard ops only
 - TFLite `Interpreter` loaded via memory-mapped `FileChannel.map()`
-- In-Kotlin tokenizer that **mirrors the training pipeline exactly** so
-  the deployed model sees input in the same shape it was trained on
+- In-Kotlin tokenizer that **mirrors the training pipeline exactly**
+  so the deployed model sees input in the same shape it was trained on
 - Graceful fallback to a deterministic keyword scorer when the TFLite
   assets are missing
 
