@@ -67,7 +67,7 @@ class PostClassifierRepository(context: Context) {
                 confidence = top?.score ?: 0f,
                 allScores = allScores,
                 usedRealModel = true,
-                modelName = "TensorFlow Lite (word-embedding)",
+                modelName = "TensorFlow Lite (MobileBERT)",
             )
             Log.d(TAG, "classify(\"${text.take(40)}\") -> ${result.label} " +
                     "(${result.confidence}) usedRealModel=true")

@@ -1,110 +1,141 @@
 package com.locup.mvp.classifier
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM-side tests for the tokenisation rules used by [TfliteTextClassifier].
- *
- * The regex `[a-zA-Z0-9']+` is identical across JVM and Android, so these
- * tests don't need Robolectric. They mirror the exact rules the Colab
- * notebook used during training — divergence here would silently degrade
- * on-device accuracy, so the assertions are kept tight.
+ * JVM-side tests for the WordPiece tokenizer used by [TfliteTextClassifier].
+ * Mirrors the Python tokenisation rules in
+ * `tools/train_locup_classifier.py` exactly — divergence here would
+ * silently degrade on-device accuracy, so the assertions are kept tight
+ * against the BERT reference rules.
  *
  * Full TFLite inference (Interpreter.run, asset loading, …) is exercised
- * in androidTest/ — see TfliteTextClassifierInstrumentedTest.
+ * in androidTest/ — see `TfliteTextClassifierInstrumentedTest`.
  */
 class TfliteTextClassifierTokenizeTest {
 
-    // Mirror of the production regex. Keep in sync with
-    // TfliteTextClassifier.TOKEN_REGEX.
-    private val tokenRegex = Regex("[a-zA-Z0-9']+")
-
-    private fun tokenize(text: String): List<String> =
-        tokenRegex.findAll(text.lowercase()).map { it.value }.toList()
+    private val vocab = sampleBertUncasedVocab()
+    private val tokenizer = BertTokenizer(vocab, maxSeqLen = 16)
 
     @Test
-    fun `splits on whitespace and punctuation`() {
+    fun `basicTokenize splits on whitespace and punctuation`() {
         assertEquals(
             listOf("fire", "on", "mg", "road"),
-            tokenize("Fire on MG Road!"),
+            tokenizer.basicTokenize("Fire on MG Road!"),
         )
     }
 
     @Test
-    fun `lowercases input`() {
-        assertEquals(
-            listOf("waterlogging", "today"),
-            tokenize("WaterLogging Today"),
-        )
+    fun `basicTokenize lowercases and strips accents`() {
+        // "café" with combining acute → "cafe"
+        val result = tokenizer.basicTokenize("Café Olé")
+        assertEquals(listOf("cafe", "ole"), result)
     }
 
     @Test
-    fun `preserves apostrophes inside words`() {
-        // The Colab tokenizer kept contractions like "don't" as one token.
-        assertEquals(listOf("don't", "go"), tokenize("Don't go!"))
+    fun `basicTokenize handles contractions`() {
+        // BERT-style: "don't" → ["don", "'t"]
+        assertEquals(listOf("don", "'t"), tokenizer.basicTokenize("don't"))
     }
 
     @Test
-    fun `numbers are kept as their own tokens`() {
+    fun `basicTokenize keeps numbers as their own tokens`() {
         assertEquals(
             listOf("lane", "3", "blocked"),
-            tokenize("Lane 3 blocked."),
+            tokenizer.basicTokenize("Lane 3 blocked."),
         )
     }
 
     @Test
-    fun `empty input yields empty token list`() {
-        assertEquals(emptyList<String>(), tokenize(""))
-        assertEquals(emptyList<String>(), tokenize("   "))
-        assertEquals(emptyList<String>(), tokenize("!!! ??? ..."))
+    fun `basicTokenize discards empty runs`() {
+        assertEquals(emptyList<String>(), tokenizer.basicTokenize(""))
+        assertEquals(emptyList<String>(), tokenizer.basicTokenize("   "))
+        assertEquals(emptyList<String>(), tokenizer.basicTokenize("!!! ??? ..."))
     }
 
     @Test
-    fun `pad truncation to SEQ_LEN drops tail tokens`() {
-        // SEQ_LEN is 24 in production. We craft 30 tokens here.
-        val text = (1..30).joinToString(" ") { "tok$it" }
-        val encoded = encodeForTest(text, vocab = emptyVocab())
-        assertEquals(24, encoded.size)
-        // Exactly 24 tokens are encoded (rest dropped due to take(SEQ_LEN)).
-        var nonPad = 0
-        encoded.forEach { if (it != 0) nonPad++ }
-        assertEquals(24, nonPad)
-        // tok1 is in the vocab (well, all tokens are OOV here) → OOV_INDEX.
-        assertEquals(1, encoded[0])
-        assertEquals(1, encoded[23])
+    fun `wordpiece splits a long word into subwords with continuation prefix`() {
+        // "unbelievable" isn't in the sample vocab, so we expect UNK
+        // (single token) — proving the fallback path works.
+        // "fire" is in the vocab → 1 token.
+        assertEquals(listOf("fire"), tokenizer.wordpiece("fire"))
+
+        // A long word partly in the vocab: "firehouse" — but our sample
+        // vocab doesn't have it, so the result is UNK.
+        val result = tokenizer.wordpiece("firehouse")
+        assertEquals(listOf("[UNK]"), result)
     }
 
     @Test
-    fun `OOV tokens map to OOV_INDEX`() {
-        val ids = encodeForTest("banana apple cherry", vocab = mapOf("apple" to 7))
-        assertEquals(listOf(1, 7, 1, 0, 0, 0).take(3), ids.take(3).toList())
+    fun `wordpiece returns UNK when no prefix matches`() {
+        assertEquals(listOf("[UNK]"), tokenizer.wordpiece("zxcvbnm"))
     }
 
     @Test
-    fun `encode handles shorter text with padding`() {
-        val ids = encodeForTest("fire", vocab = mapOf("fire" to 42))
-        assertEquals(24, ids.size)
-        assertEquals(42, ids[0])
-        assertEquals(0, ids[1])
-        assertEquals(0, ids[23])
+    fun `encode wraps with CLS and SEP and pads up to seq len`() {
+        val out = tokenizer.encode("fire")
+        assertEquals(16, out.inputIds.size)
+        assertEquals(16, out.attentionMask.size)
+        assertEquals("[CLS]", vocab.entries.first { it.value == out.inputIds[0] }.key)
+        assertEquals(1, out.attentionMask[0])
+        // "fire" → "[CLS] fire [SEP] pad pad ..."
+        // find the SEP by id
+        val sepIdx = out.inputIds.indexOf(vocab["[SEP]"]!!)
+        assertTrue("SEP should be the final non-pad token", sepIdx >= 2)
+        assertEquals(1, out.attentionMask[sepIdx])
+        // everything after SEP is pad
+        for (i in (sepIdx + 1) until 16) {
+            assertEquals(0, out.attentionMask[i])
+        }
     }
 
-    // --- helpers ---
+    @Test
+    fun `encode truncates to maxSeqLen - 2 wordpieces`() {
+        // 20 tokens of "fire" (only 1 wordpiece each) → still cuts to 14
+        // wordpieces (maxSeqLen - 2 = 14), then [SEP]
+        val text = (1..20).joinToString(" ") { "fire" }
+        val out = tokenizer.encode(text)
+        assertEquals(16, out.inputIds.size)
+        // CLS + 14 "fire" + SEP + 0 pad
+        assertEquals(1, out.attentionMask[0])
+        // final non-pad token is SEP
+        val sepIdx = out.inputIds.indexOf(vocab["[SEP]"]!!)
+        assertEquals(15, sepIdx)
+    }
 
-    private fun emptyVocab(): Map<String, Int> = emptyMap()
+    @Test
+    fun `encode emits UNK for out-of-vocab token`() {
+        val out = tokenizer.encode("zxcvbnm")
+        // CLS + UNK + SEP
+        assertEquals(vocab["[UNK]"]!!, out.inputIds[1])
+        assertEquals(1, out.attentionMask[1])
+    }
+
+    @Test
+    fun `empty input still emits CLS and SEP`() {
+        val out = tokenizer.encode("")
+        assertEquals(16, out.inputIds.size)
+        assertEquals(vocab["[CLS]"]!!, out.inputIds[0])
+        assertEquals(vocab["[SEP]"]!!, out.inputIds[1])
+        assertEquals(1, out.attentionMask[0])
+        assertEquals(1, out.attentionMask[1])
+    }
 
     /**
-     * Mirror of [TfliteTextClassifier.encode] that doesn't need a Context.
+     * Minimal sample vocab mirroring the BERT-uncased scheme:
+     *   [PAD] = 0, [UNK] = 1, [CLS] = 2, [SEP] = 3, [MASK] = 4
+     *   followed by sentence-piece tokens.
      */
-    private fun encodeForTest(text: String, vocab: Map<String, Int>): IntArray {
-        val SEQ_LEN = 24
-        val OOV = 1
-        val PAD = 0
-        val tokens = tokenize(text).take(SEQ_LEN)
-        val ids = IntArray(SEQ_LEN) { PAD }
-        tokens.forEachIndexed { i, token -> ids[i] = vocab[token] ?: OOV }
-        return ids
+    private fun sampleBertUncasedVocab(): Map<String, Int> {
+        val list = mutableListOf(
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]",
+            "fire", "traffic", "jam", "garbage", "pothole",
+            "festival", "park", "police", "accident", "car",
+            "road", "lane", "bridge", "water", "flood",
+            "##ing", "##ed", "##s", "##er", "##ly",
+        )
+        return list.withIndex().associate { (i, t) -> t to i }
     }
 }

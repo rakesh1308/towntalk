@@ -40,8 +40,9 @@ class TfliteTextClassifierInstrumentedTest {
             "Model asset missing — install locup_text_classifier.tflite in app/src/main/assets/ first",
             "locup_text_classifier.tflite" in assets,
         )
-        assumeTrue("vocab.json missing", "vocab.json" in assets)
+        assumeTrue("vocab.txt missing", "vocab.txt" in assets)
         assumeTrue("labels.txt missing", "labels.txt" in assets)
+        assumeTrue("max_seq_len.txt missing", "max_seq_len.txt" in assets)
 
         classifier = TfliteTextClassifier(ctx)
     }
@@ -49,13 +50,7 @@ class TfliteTextClassifierInstrumentedTest {
     @Test fun model_loads_successfully() {
         assertTrue("Interpreter should have loaded", classifier.isModelAvailable)
         assertEquals("Expected 5-class classifier", 5, classifier.labelCount)
-        assertTrue("Vocab should have hundreds of tokens", classifier.vocabSize > 100)
-    }
-
-    @Test fun tokenize_runs_on_sample_post() {
-        val tokens = classifier.tokenize("Fire on MG Road, drive around!")
-        assertTrue("Expected non-empty tokens", tokens.isNotEmpty())
-        assertTrue("Expected 'fire' in tokens", "fire" in tokens)
+        assertTrue("BERT vocab should have thousands of tokens", classifier.vocabSize > 1000)
     }
 
     @Test fun classify_produces_real_distribution() {

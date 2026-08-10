@@ -2,43 +2,41 @@ package com.locup.mvp.classifier
 
 import android.content.Context
 import android.util.Log
-import org.json.JSONObject
 import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import java.io.FileInputStream
 
 /**
  * On-device post classifier using the plain TFLite runtime — no MediaPipe
  * Tasks, no Task Library, no bundled tokenizer metadata. Tokenization is
- * done here in Kotlin, mirroring the exact same logic used when the model
- * was trained (see the Colab notebook, section 3/4): lowercase, split on
- * non-alphanumeric characters, map to vocab indices, pad/truncate to a
- * fixed length.
+ * done here in Kotlin via [BertTokenizer], mirroring the exact same logic
+ * used when the model was trained (see [tools/train_locup_classifier.py](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.py)):
+ *   - lowercase + Unicode NFKD + accent strip
+ *   - split on whitespace + punctuation
+ *   - greedy longest-match WordPiece against `vocab.txt`
+ *   - `[CLS]` / `[SEP]` wrapping, pad/truncate to `MAX_SEQ_LEN`.
  *
- * Expects three assets in app/src/main/assets/:
- *   - locup_text_classifier.tflite
- *   - vocab.json       (word -> index map, produced by the notebook)
- *   - labels.txt        (one label per line, in model output order)
+ * Expects four assets in `app/src/main/assets/`:
+ *   - `locup_text_classifier.tflite` — the MobileBERT fine-tune, INT8 quantised
+ *   - `vocab.txt`                    — one token per line, line number = index
+ *   - `labels.txt`                   — class names, one per line, in model output order
+ *   - `max_seq_len.txt`              — single integer, e.g. "64"
+ *
+ * The model is interpreted with three inputs (input_ids, attention_mask,
+ * token_type_ids) and one output (a softmax over the 5 classes).
  *
  * If any asset is missing, [isModelAvailable] returns false and callers
- * should fall back to the existing deterministic keyword scorer already
- * in the repo — this class deliberately does NOT throw in that case.
+ * should fall back to the existing deterministic keyword scorer.
  */
 class TfliteTextClassifier(private val context: Context) {
 
     companion object {
         private const val TAG = "TfliteTextClassifier"
         private const val MODEL_ASSET = "locup_text_classifier.tflite"
-        private const val VOCAB_ASSET = "vocab.json"
+        private const val VOCAB_ASSET = "vocab.txt"
         private const val LABELS_ASSET = "labels.txt"
-        private const val SEQ_LEN = 24 // must match the notebook's SEQ_LEN
-        private const val OOV_INDEX = 1
-        private const val PAD_INDEX = 0
-
-        // Same tokenizer as the Python side: lowercase, split on runs of
-        // letters/digits/apostrophes, drop everything else.
-        private val TOKEN_REGEX = Regex("[a-zA-Z0-9']+")
+        private const val SEQ_LEN_ASSET = "max_seq_len.txt"
     }
 
     data class LabelScore(val label: String, val score: Float)
@@ -47,6 +45,11 @@ class TfliteTextClassifier(private val context: Context) {
         val interpreter: Interpreter,
         val vocab: Map<String, Int>,
         val labels: List<String>,
+        val tokenizer: BertTokenizer,
+        val inputIdsName: String,
+        val attentionMaskName: String,
+        val tokenTypeIdsName: String,
+        val outputName: String,
     )
 
     private val model: LoadedModel? by lazy { tryLoad() }
@@ -64,17 +67,45 @@ class TfliteTextClassifier(private val context: Context) {
     /** Number of output labels (for diagnostics). */
     val labelCount: Int get() = model?.labels?.size ?: 0
 
+    /** Pad / sequence length used by the model (for diagnostics). */
+    @Suppress("unused")
+    val maxSeqLen: Int get() = model?.let { m ->
+        m.interpreter.getInputTensor(0).shape()?.get(1) ?: 0
+    } ?: 0
+
     private fun tryLoad(): LoadedModel? {
         return try {
             Log.i(TAG, "Loading TFLite model from assets/$MODEL_ASSET")
+            val maxSeqLen = loadMaxSeqLen()
+            Log.i(TAG, "MAX_SEQ_LEN = $maxSeqLen")
             val vocab = loadVocab()
             Log.i(TAG, "Vocab loaded: ${vocab.size} tokens")
             val labels = loadLabels()
             Log.i(TAG, "Labels loaded: $labels")
+            val tokenizer = BertTokenizer(vocab, maxSeqLen)
             val interpreter = Interpreter(loadModelFile())
-            Log.i(TAG, "Interpreter loaded — input shape: ${interpreter.getInputTensor(0).shape()}, " +
-                    "output shape: ${interpreter.getOutputTensor(0).shape()}")
-            LoadedModel(interpreter, vocab, labels)
+            val inputIdsName = interpreter.getInputTensor(0).name()
+            val attentionMaskName = interpreter.getInputTensor(1).name()
+            val tokenTypeIdsName = interpreter.getInputTensor(2).name()
+            val outputName = interpreter.getOutputTensor(0).name()
+            Log.i(
+                TAG,
+                "Interpreter loaded — inputs: " +
+                        "[$inputIdsName, $attentionMaskName, $tokenTypeIdsName], " +
+                        "output: $outputName, " +
+                        "input shape: ${interpreter.getInputTensor(0).shape()}, " +
+                        "output shape: ${interpreter.getOutputTensor(0).shape()}",
+            )
+            LoadedModel(
+                interpreter = interpreter,
+                vocab = vocab,
+                labels = labels,
+                tokenizer = tokenizer,
+                inputIdsName = inputIdsName,
+                attentionMaskName = attentionMaskName,
+                tokenTypeIdsName = tokenTypeIdsName,
+                outputName = outputName,
+            )
         } catch (e: Exception) {
             Log.w(TAG, "TFLite model not loaded — falling back: ${e.message}")
             null
@@ -93,10 +124,19 @@ class TfliteTextClassifier(private val context: Context) {
     }
 
     private fun loadVocab(): Map<String, Int> {
-        val json = context.assets.open(VOCAB_ASSET).bufferedReader().use { it.readText() }
-        val obj = JSONObject(json)
-        val map = mutableMapOf<String, Int>()
-        obj.keys().forEach { key -> map[key] = obj.getInt(key) }
+        val map = HashMap<String, Int>()
+        context.assets.open(VOCAB_ASSET).bufferedReader().use { reader ->
+            var line = reader.readLine()
+            var idx = 0
+            while (line != null) {
+                val token = line.trim()
+                if (token.isNotEmpty()) {
+                    map[token] = idx
+                }
+                idx += 1
+                line = reader.readLine()
+            }
+        }
         return map
     }
 
@@ -107,32 +147,19 @@ class TfliteTextClassifier(private val context: Context) {
             .filter { it.isNotEmpty() }
     }
 
-    /**
-     * Tokenisation matches the Python notebook exactly: lowercase, then
-     * match runs of letters/digits/apostrophes. Everything else is dropped.
-     */
-    fun tokenize(text: String): List<String> {
-        return TOKEN_REGEX.findAll(text.lowercase()).map { it.value }.toList()
-    }
-
-    /**
-     * Encode a string into the model's input tensor. Padding / truncation
-     * to [SEQ_LEN] is applied. Out-of-vocab tokens map to [OOV_INDEX].
-     */
-    fun encode(text: String, vocab: Map<String, Int>): IntArray {
-        val tokens = tokenize(text).take(SEQ_LEN)
-        val ids = IntArray(SEQ_LEN) { PAD_INDEX }
-        tokens.forEachIndexed { i, token ->
-            ids[i] = vocab[token] ?: OOV_INDEX
+    private fun loadMaxSeqLen(): Int {
+        val raw = context.assets.open(SEQ_LEN_ASSET).bufferedReader().use { it.readText() }
+        val n = raw.trim().toIntOrNull()
+            ?: throw IllegalStateException("Could not parse MAX_SEQ_LEN from $SEQ_LEN_ASSET: '$raw'")
+        if (n <= 0 || n > 512) {
+            throw IllegalStateException("MAX_SEQ_LEN out of range: $n")
         }
-        return ids
+        return n
     }
 
     /**
      * Returns the full probability distribution across all labels,
-     * sorted by score descending. Empty list if the model isn't available —
-     * callers should check [isModelAvailable] first and use the keyword
-     * fallback scorer in that case.
+     * sorted by score descending. Empty list if the model isn't available.
      */
     fun classify(text: String): List<LabelScore> {
         val loaded = model ?: run {
@@ -144,16 +171,26 @@ class TfliteTextClassifier(private val context: Context) {
             return emptyList()
         }
 
-        val inputIds = encode(text, loaded.vocab)
-        val preview = inputIds.take(8).joinToString(",")
-        Log.d(TAG, "classify(\"${text.take(40)}\") tokens=${tokenize(text)} ids=[$preview,...]")
+        val tokens = loaded.tokenizer.encode(text)
+        val n = tokens.inputIds.size
+        Log.d(TAG, "classify(\"${text.take(40)}\") seqLen=$n")
 
-        // Interpreter expects shape [1, SEQ_LEN]
-        val input = Array(1) { inputIds }
+        // MobileBERT expects three inputs of shape [1, MAX_SEQ_LEN]:
+        //   input_ids, attention_mask, token_type_ids.
+        val inputIds = Array(1) { tokens.inputIds }
+        val attentionMask = Array(1) { tokens.attentionMask }
+        val tokenTypeIds = Array(1) { IntArray(n) } // all zeros (single sentence)
         val output = Array(1) { FloatArray(loaded.labels.size) }
 
         try {
-            loaded.interpreter.run(input, output)
+            loaded.interpreter.run(
+                mapOf(
+                    loaded.inputIdsName to inputIds,
+                    loaded.attentionMaskName to attentionMask,
+                    loaded.tokenTypeIdsName to tokenTypeIds,
+                ),
+                mapOf(loaded.outputName to output),
+            )
         } catch (t: Throwable) {
             Log.e(TAG, "Interpreter.run failed: ${t.message}", t)
             return emptyList()
@@ -161,7 +198,10 @@ class TfliteTextClassifier(private val context: Context) {
 
         val raw = output[0]
         val sumCheck = raw.sum()
-        Log.d(TAG, "  raw scores = ${raw.joinToString(",") { "%.3f".format(it) }} (sum=%.3f)".format(sumCheck))
+        Log.d(
+            TAG,
+            "  raw scores = ${raw.joinToString(",") { "%.3f".format(it) }} (sum=%.3f)".format(sumCheck),
+        )
 
         return loaded.labels.indices
             .map { i -> LabelScore(loaded.labels[i], output[0][i]) }
@@ -169,9 +209,7 @@ class TfliteTextClassifier(private val context: Context) {
     }
 
     /** Convenience: just the winning label + confidence. */
-    fun classifyTopLabel(text: String): LabelScore? {
-        return classify(text).firstOrNull()
-    }
+    fun classifyTopLabel(text: String): LabelScore? = classify(text).firstOrNull()
 
     fun close() {
         model?.interpreter?.close()

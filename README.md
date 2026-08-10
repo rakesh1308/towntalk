@@ -1,12 +1,14 @@
-# LocUp — On-device text classification on Android
+# LocUp — MobileBERT on Android
 
-> A hyperlocal social feed that classifies every post on-device with
-> TensorFlow Lite. No servers, no API keys, no Play Services.
+> A hyperlocal social feed that classifies every post on-device with a
+> fine-tuned **MobileBERT** transformer running through TensorFlow Lite.
+> No servers, no API keys, no Play Services.
 
 ![Android](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
 ![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white)
 ![TensorFlow Lite](https://img.shields.io/badge/ML-TensorFlow%20Lite-FF6F00?logo=tensorflow&logoColor=white)
+![MobileBERT](https://img.shields.io/badge/Model-MobileBERT-FFB000)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
 ## What it is
@@ -16,10 +18,10 @@ neighbourhood social feed classify its own posts — Emergency / Traffic
 / Event / Civic / General — without ever calling a server?*
 
 The app reads the user's GPS, buckets the post into a stable `~1 km ×
-1 km` grid cell, and runs a **word-embedding text classifier on the
-device CPU/NPU**. The UI shows the live probability distribution for
-all five labels as the user types, then publishes the post with the
-winning label + confidence attached.
+1 km` grid cell, and runs a **MobileBERT fine-tune on the device
+CPU/NPU**. The UI shows the live probability distribution for all five
+labels as the user types, then publishes the post with the winning
+label + confidence attached.
 
 If the TFLite model assets can't be loaded, the classifier transparently
 falls back to a deterministic keyword scorer so the end-to-end flow
@@ -27,121 +29,146 @@ stays demoable on any device.
 
 ---
 
-## Approach — local model inference, end to end
+## Approach — local transformer inference, end to end
 
 ```mermaid
 flowchart LR
     subgraph Build["Build pipeline (Colab)"]
-        CSV[train.csv<br/>train / test split] --> V[Vocabulary<br/>top 3000 tokens]
-        V --> E[Encoder<br/>token -> IntArray SEQ_LEN=24]
-        E --> K[Keras model<br/>Embedding + Pool + Dense]
-        K --> C[TFLiteConverter]
-        C --> A1[locup_text_classifier.tflite]
-        C --> A2[vocab.json]
-        C --> A3[labels.txt]
+        CSV[250 labelled posts<br/>50 per category] --> Tk[AutoTokenizer<br/>MobileBERT-uncased]
+        Tk --> Mbm[TFAutoModel<br/>google/mobilebert-uncased]
+        Mbm --> Head[Dropout + Dense 5]
+        Head --> Train[Fine-tune<br/>5 epochs, lr=2e-5]
+        Train --> Conv[TFLiteConverter<br/>dynamic-range quant]
+        Conv --> A1[locup_text_classifier.tflite<br/>~25 MB]
+        Conv --> A2[vocab.txt<br/>~30k tokens]
+        Conv --> A3[labels.txt]
+        Conv --> A4[max_seq_len.txt]
     end
 
     subgraph Ship["Shipped in the APK"]
         A1 --> Assets[(app/src/main/assets/)]
         A2 --> Assets
         A3 --> Assets
+        A4 --> Assets
     end
 
     subgraph Runtime["On-device inference (Android)"]
-        Compose[ComposeSheet<br/>live keystroke] --> Tok[Kotlin tokenize<br/>mirrors Python regex]
-        Assets -->|memory-mapped<br/>FileChannel.map| TFLite[Interpreter]
-        Tok --> Enc[Kotlin encode<br/>vocab lookup, OOV=1, PAD=0]
-        Enc --> TFLite
-        TFLite --> Out[FloatArray labels.size<br/>softmax]
+        Compose[ComposeSheet<br/>live keystroke] --> Norm[basicTokenize<br/>NFKD + lowercase + accent strip]
+        Norm --> WP[wordpiece<br/>greedy longest-match]
+        Assets -.vocab.txt.-> WP
+        WP --> Enc[CLS / SEP + pad<br/>IntArray MAX_SEQ_LEN]
+        Enc --> Run[Interpreter.run<br/>3 inputs: input_ids,<br/>attention_mask, token_type_ids]
+        Run --> Out[FloatArray 5<br/>softmax]
         Out --> Bars[Live probability bars]
     end
 
     Bars -.fallback if assets missing.-> KW[KeywordFallback.score]
 ```
 
-**Plain Python on the build side, plain `Interpreter` on the device
-side — no Task Library, no MediaPipe, no bundled tokenizer metadata.**
+**Plain HuggingFace `transformers` on the build side, plain TFLite
+`Interpreter` on the device side — no Task Library, no MediaPipe, no
+bundled tokenizer metadata.**
 
-The model side intentionally **tokenizes outside the graph** (custom
-Keras `Embedding` + `GlobalAveragePooling1D` + `Dense`). That keeps
-the TFLite graph to standard ops only, which is what makes the
-conversion and on-device run trouble-free.
+The tokenizer is hand-rolled in Kotlin (`BertTokenizer.kt`) and matches
+the Python `AutoTokenizer` rules exactly: lowercase + Unicode NFKD +
+accent strip, the standard BERT basic-tokenizer regex, then greedy
+longest-match WordPiece against the loaded `vocab.txt`. The same
+vocab.txt is loaded by Python training and by the Android app, so
+input ids line up byte-for-byte.
 
 ---
 
 ## Build the model
 
 ```python
-def tokenize(text):
-    return re.findall(r"[a-zA-Z0-9']+", text.lower())
+from transformers import AutoTokenizer, TFAutoModel
 
-counter = Counter()
-for t in train_texts:
-    counter.update(tokenize(t))
+MODEL_NAME = "google/mobilebert-uncased"
+MAX_SEQ_LEN = 64
 
-most_common = [w for w, _ in counter.most_common(VOCAB_SIZE - 2)]
-word_to_idx = {"<PAD>": 0, "<OOV>": 1}
-for i, w in enumerate(most_common):
-    word_to_idx[w] = i + 2
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+base = TFAutoModel.from_pretrained(MODEL_NAME)
 
-def encode(text):
-    tokens = tokenize(text)[:SEQ_LEN]                # SEQ_LEN = 24
-    ids = [word_to_idx.get(t, 1) for t in tokens]     # 1 = OOV
-    ids += [0] * (SEQ_LEN - len(ids))                 # 0 = PAD
-    return ids
-
-model = keras.Sequential([
-    keras.layers.Input(shape=(SEQ_LEN,), dtype=tf.int32),
-    keras.layers.Embedding(input_dim=VOCAB_SIZE, output_dim=48),
-    keras.layers.GlobalAveragePooling1D(),
-    keras.layers.Dense(64, activation='relu'),
-    keras.layers.Dropout(0.3),
-    keras.layers.Dense(NUM_CLASSES, activation='softmax'),
-])
-model.compile(optimizer='adam',
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
-model.fit(X_train, y_train, validation_data=(X_test, y_test),
-          epochs=25, batch_size=32)
+input_ids = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="input_ids")
+attention_mask = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="attention_mask")
+token_type_ids = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="token_type_ids")
+outputs = base(input_ids=input_ids, attention_mask=attention_mask,
+               token_type_ids=token_type_ids)
+cls = outputs.last_hidden_state[:, 0, :]
+x = tf.keras.layers.Dropout(0.1)(cls)
+logits = tf.keras.layers.Dense(5, activation="softmax", name="classifier")(x)
+model = tf.keras.Model(
+    inputs=[input_ids, attention_mask, token_type_ids],
+    outputs=logits,
+)
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-5),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+model.fit(x, y, validation_data=(xv, yv), epochs=5, batch_size=16)
 
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]   # dynamic-range quant
 tflite_model = converter.convert()
 ```
 
-Drop the three artefacts into `app/src/main/assets/` and the app
-picks them up. The same `regex` and `SEQ_LEN` shape are
-re-implemented in Kotlin so the device sees input in the exact
-shape the model was trained on.
+The training script lives at `tools/train_locup_classifier.py` (with a
+Colab-ready notebook at `tools/train_locup_classifier.ipynb`) and
+ships with 250 short, realistic posts (50 per category) — no API
+calls, no external datasets. Drop the four assets into
+`app/src/main/assets/` and the app picks them up.
 
 ---
 
 ## Run inference on the device
 
 `PostClassifierRepository` is the single entry point. It owns
-`TfliteTextClassifier` (real model) and `LocalClassifier` (keyword
+`TfliteTextClassifier` (real MobileBERT) and `LocalClassifier` (keyword
 fallback) and picks at call time.
 
 ```kotlin
-private val TOKEN_REGEX = Regex("[a-zA-Z0-9']+")
+class BertTokenizer(vocab: Map<String, Int>, maxSeqLen: Int) {
+    fun basicTokenize(text: String): List<String> {
+        val normalized = Normalizer.normalize(text, Normalizer.Form.NFKD)
+            .lowercase()
+            .replace("\\p{InCombiningDiacriticalMarks}+".toRegex(), "")
+        // BERT's basic tokenizer regex: contractions, words, numbers,
+        // punctuation, whitespace.
+        return BASIC_TOKEN_PATTERN.matcher(normalized).run {
+            buildList { while (find()) append(group().trim()) }
+        }
+    }
 
-fun tokenize(text: String): List<String> =
-    TOKEN_REGEX.findAll(text.lowercase()).map { it.value }.toList()
+    fun wordpiece(token: String): List<String> =
+        // Greedy longest-match against the loaded vocab, ## continuation
+        // prefix for sub-segments. UNK if no match.
+        ...
 
-fun encode(text: String, vocab: Map<String, Int>): IntArray {
-    val tokens = tokenize(text).take(SEQ_LEN)                   // SEQ_LEN = 24
-    val ids = IntArray(SEQ_LEN) { PAD_INDEX }                   // 0 = PAD
-    tokens.forEachIndexed { i, t -> ids[i] = vocab[t] ?: OOV_INDEX }  // 1 = OOV
-    return ids
+    fun encode(text: String): TokenizedInput {
+        val pieces = basicTokenize(text).flatMap(::wordpiece).take(maxSeqLen - 2)
+        // Wrap with [CLS] / [SEP], pad to maxSeqLen, return input_ids +
+        // attention_mask (token_type_ids are all zeros).
+        ...
+    }
 }
 
-val input  = Array(1) { inputIds }                  // [1, 24]
-val output = Array(1) { FloatArray(labels.size) }   // [1, 5]
-interpreter.run(input, output)
+val t = loaded.tokenizer.encode(text)
+val inputIds      = Array(1) { t.inputIds }
+val attentionMask = Array(1) { t.attentionMask }
+val tokenTypeIds  = Array(1) { IntArray(MAX_SEQ_LEN) }   // single sentence
+val output        = Array(1) { FloatArray(5) }
+interpreter.run(
+    mapOf("input_ids" to inputIds,
+          "attention_mask" to attentionMask,
+          "token_type_ids" to tokenTypeIds),
+    mapOf("classifier" to output),
+)
 ```
 
 Loading uses `context.assets.openFd()` → `FileChannel.map()` → a
 memory-mapped `MappedByteBuffer`, so first-inference start-up is
-essentially free. If any of the three assets is missing the model
+essentially free. If any of the four assets is missing the model
 returns `null` from `tryLoad()` and the repository falls back to the
 keyword scorer — banner turns green when the real path is active.
 
@@ -159,13 +186,24 @@ keyword scorer — banner turns green when the real path is active.
 
 **AI / ML**
 
-- End-to-end on-device text classification — CSV → Keras → TFLite →
+- End-to-end on-device transformer inference — CSV → HuggingFace
+  fine-tune → `TFLiteConverter` with dynamic-range quantisation →
   APK assets → in-app `Interpreter`
-- Custom Keras word-embedding model (Embedding + Pool + Dense),
-  standard ops only
+- MobileBERT (`google/mobilebert-uncased`) fine-tuned for 5 epochs
+  at lr=2e-5 on a custom 5-class dataset
+- `TFLiteConverter` with **`tf.lite.Optimize.DEFAULT`** for
+  ~4× model size reduction
+- 3-input TFLite graph (`input_ids`, `attention_mask`,
+  `token_type_ids`) read directly via `Interpreter.run(...)`
+- Hand-rolled **WordPiece tokenizer in Kotlin** that mirrors the
+  Python `AutoTokenizer` rules exactly:
+  - NFKD Unicode normalisation + accent stripping
+  - BERT's basic-tokenizer regex (contractions, words, numbers,
+    punctuation)
+  - Greedy longest-match-first WordPiece with `##` continuation
+    prefixes
+  - `[CLS]` / `[SEP]` wrapping and `[PAD]` padding
 - TFLite `Interpreter` loaded via memory-mapped `FileChannel.map()`
-- In-Kotlin tokenizer that **mirrors the training pipeline exactly**
-  so the deployed model sees input in the same shape it was trained on
 - Graceful fallback to a deterministic keyword scorer when the TFLite
   assets are missing
 
@@ -178,8 +216,26 @@ keyword scorer — banner turns green when the real path is active.
 ./gradlew test
 ```
 
-APK lands in `app/build/outputs/apk/debug/`. Tests cover `Cluster.idFor`
-geo-bucketing and the `KeywordFallback` scorer.
+APK lands in `app/build/outputs/apk/debug/`. The model file is ~25 MB
+(dynamic-range quantised), so the APK is correspondingly larger than
+a typical tiny demo. Tests cover `Cluster.idFor` geo-bucketing, the
+`KeywordFallback` scorer, and the `BertTokenizer` rules.
+
+To regenerate the model:
+
+**Option A — Colab notebook (recommended)**:
+
+Open [tools/train_locup_classifier.ipynb](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.ipynb)
+in Colab, switch to a T4 GPU runtime, run all cells. The last cell
+downloads a `locup_assets.zip` containing the four assets. Unzip
+into `app/src/main/assets/` (and delete the old `vocab.json` if present).
+
+**Option B — Command line**:
+
+```bash
+pip install transformers tensorflow
+python tools/train_locup_classifier.py
+```
 
 ## Permissions
 
@@ -198,7 +254,8 @@ app/src/main/java/com/locup/mvp
 ├── MainActivity.kt                            # wires LocationProvider + classifier + repo + Compose tree
 ├── classifier/
 │   ├── PostClassifierRepository.kt             # single entry point: real model or fallback
-│   └── TfliteTextClassifier.kt                 # TFLite Interpreter + in-Kotlin tokenizer
+│   ├── TfliteTextClassifier.kt                 # TFLite Interpreter + 3-input wiring
+│   └── BertTokenizer.kt                        # WordPiece tokenizer, mirrors Python AutoTokenizer
 ├── ml/
 │   ├── LocalClassifier.kt                     # TFLite wrapper used by the fallback path
 │   └── KeywordFallback.kt                     # deterministic hash-BoW scorer
@@ -216,7 +273,8 @@ app/src/main/java/com/locup/mvp
     └── LocUpApp.kt                            # Scaffold + feed + ComposeSheet + filter chips
 ```
 
-Training script: `tools/train_locup_classifier.py`.
+Training script: [`tools/train_locup_classifier.py`](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.py)
++ Colab notebook: [`tools/train_locup_classifier.ipynb`](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.ipynb).
 
 ---
 
