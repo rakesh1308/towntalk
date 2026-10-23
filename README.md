@@ -1,283 +1,246 @@
-# LocUp — MobileBERT on Android
+# TownTalk
 
-> A hyperlocal social feed that classifies every post on-device with a
-> fine-tuned **MobileBERT** transformer running through TensorFlow Lite.
-> No servers, no API keys, no Play Services.
+> A hyperlocal social feed that classifies every post **on-device**, with no
+> server, no API keys, and no network permission.
+>
+> The demo answers one question: *can a neighbourhood feed label its own posts
+> — Emergency / Traffic / Event / Civic / General — entirely on the phone?*
 
 ![Android](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
 ![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white)
 ![TensorFlow Lite](https://img.shields.io/badge/ML-TensorFlow%20Lite-FF6F00?logo=tensorflow&logoColor=white)
-![MobileBERT](https://img.shields.io/badge/Model-MobileBERT-FFB000)
-![License](https://img.shields.io/badge/License-MIT-blue)
-
-## What it is
-
-LocUp is a tiny Android MVP that explores one idea: *can a
-neighbourhood social feed classify its own posts — Emergency / Traffic
-/ Event / Civic / General — without ever calling a server?*
-
-The app reads the user's GPS, buckets the post into a stable `~1 km ×
-1 km` grid cell, and runs a **MobileBERT fine-tune on the device
-CPU/NPU**. The UI shows the live probability distribution for all five
-labels as the user types, then publishes the post with the winning
-label + confidence attached.
-
-If the TFLite model assets can't be loaded, the classifier transparently
-falls back to a deterministic keyword scorer so the end-to-end flow
-stays demoable on any device.
 
 ---
 
-## Approach — local transformer inference, end to end
+## What it does
 
-```mermaid
-flowchart LR
-    subgraph Build["Build pipeline (Colab)"]
-        CSV[250 labelled posts<br/>50 per category] --> Tk[AutoTokenizer<br/>MobileBERT-uncased]
-        Tk --> Mbm[TFAutoModel<br/>google/mobilebert-uncased]
-        Mbm --> Head[Dropout + Dense 5]
-        Head --> Train[Fine-tune<br/>5 epochs, lr=2e-5]
-        Train --> Conv[TFLiteConverter<br/>dynamic-range quant]
-        Conv --> A1[locup_text_classifier.tflite<br/>~25 MB]
-        Conv --> A2[vocab.txt<br/>~30k tokens]
-        Conv --> A3[labels.txt]
-        Conv --> A4[max_seq_len.txt]
-    end
+The app reads your position, buckets each post into a stable ~1 km × 1 km grid
+cell, and classifies the text **locally** with TensorFlow Lite. As you type in
+the composer, the live probability distribution for all five labels updates
+after a 250 ms debounce. Publishing stores the winning label and confidence
+alongside the post.
 
-    subgraph Ship["Shipped in the APK"]
-        A1 --> Assets[(app/src/main/assets/)]
-        A2 --> Assets
-        A3 --> Assets
-        A4 --> Assets
-    end
-
-    subgraph Runtime["On-device inference (Android)"]
-        Compose[ComposeSheet<br/>live keystroke] --> Norm[basicTokenize<br/>NFKD + lowercase + accent strip]
-        Norm --> WP[wordpiece<br/>greedy longest-match]
-        Assets -.vocab.txt.-> WP
-        WP --> Enc[CLS / SEP + pad<br/>IntArray MAX_SEQ_LEN]
-        Enc --> Run[Interpreter.run<br/>3 inputs: input_ids,<br/>attention_mask, token_type_ids]
-        Run --> Out[FloatArray 5<br/>softmax]
-        Out --> Bars[Live probability bars]
-    end
-
-    Bars -.fallback if assets missing.-> KW[KeywordFallback.score]
-```
-
-**Plain HuggingFace `transformers` on the build side, plain TFLite
-`Interpreter` on the device side — no Task Library, no MediaPipe, no
-bundled tokenizer metadata.**
-
-The tokenizer is hand-rolled in Kotlin (`BertTokenizer.kt`) and matches
-the Python `AutoTokenizer` rules exactly: lowercase + Unicode NFKD +
-accent strip, the standard BERT basic-tokenizer regex, then greedy
-longest-match WordPiece against the loaded `vocab.txt`. The same
-vocab.txt is loaded by Python training and by the Android app, so
-input ids line up byte-for-byte.
+If the model assets are missing or the interpreter fails on a given device, a
+deterministic keyword scorer takes over — and the UI says so.
 
 ---
 
-## Build the model
+## The AI model: what it actually is
 
-```python
-from transformers import AutoTokenizer, TFAutoModel
+> [!IMPORTANT]
+> **This is a word-embedding MLP, not MobileBERT.**
+>
+> Earlier revisions of this repo described the bundled model as a fine-tuned
+> `google/mobilebert-uncased` transformer. That was incorrect, and the
+> difference is not cosmetic — it changes the entire input pipeline.
+>
+> The model was introspected directly from the FlatBuffer using
+> [`ai-edge-litert`](https://pypi.org/project/ai-edge-litert/). Reproduce with
+> `tools/inspect_model.py`.
 
-MODEL_NAME = "google/mobilebert-uncased"
-MAX_SEQ_LEN = 64
+**Measured signature:**
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-base = TFAutoModel.from_pretrained(MODEL_NAME)
+| Property | Actual value |
+|---|---|
+| Input tensors | **one** — `keras_tensor` |
+| Input shape / dtype | `[1, 24]` / `int32` |
+| Output tensors | **one** — `output_0` |
+| Output shape / dtype | `[1, 5]` / `float32` |
+| Signature key | `serving_default` |
+| Operators | `Embedding(GatherV2)` → `Dense(ReLU)` → `Dense(BiasAdd)` |
+| File size | **592 KB** (a MobileBERT export would be ~25 MB) |
+| Vocabulary | `vocab.json` — **578** tokens, specials `<PAD>`=0, `<OOV>`=1 |
 
-input_ids = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="input_ids")
-attention_mask = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="attention_mask")
-token_type_ids = tf.keras.Input(shape=(MAX_SEQ_LEN,), dtype=tf.int32, name="token_type_ids")
-outputs = base(input_ids=input_ids, attention_mask=attention_mask,
-               token_type_ids=token_type_ids)
-cls = outputs.last_hidden_state[:, 0, :]
-x = tf.keras.layers.Dropout(0.1)(cls)
-logits = tf.keras.layers.Dense(5, activation="softmax", name="classifier")(x)
-model = tf.keras.Model(
-    inputs=[input_ids, attention_mask, token_type_ids],
-    outputs=logits,
-)
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-5),
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"],
-)
-model.fit(x, y, validation_data=(xv, yv), epochs=5, batch_size=16)
+**Why the old loader could never work:** it looked for `vocab.txt` and
+`max_seq_len.txt` (neither ships), assumed three inputs
+(`input_ids`/`attention_mask`/`token_type_ids`), and called
+`Interpreter.run(Map, Map)` — which does **not** perform named-tensor lookup.
+A second, conflicting path (`LocalClassifier`) fed the same file a 64-dim
+float bag-of-words, which is also wrong; it silently fell back to keywords.
+The consequence was that **the real model was never used**.
 
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]   # dynamic-range quant
-tflite_model = converter.convert()
+**The pipeline that does work** (`VocabTokenizer` → `runSignature`):
+
+```
+"heavy traffic jam on the highway"
+  → lowercase, split on non-alphanumerics
+  → vocab.json lookup, unknowns → <OOV>, truncate/pad to 24
+  → int32[1,24]
+  → runSignature("serving_default")
+  → float32[1,5]
 ```
 
-The training script lives at `tools/train_locup_classifier.py` (with a
-Colab-ready notebook at `tools/train_locup_classifier.ipynb`) and
-ships with 250 short, realistic posts (50 per category) — no API
-calls, no external datasets. Drop the four assets into
-`app/src/main/assets/` and the app picks them up.
+There is no `[CLS]`/`[SEP]`: the model has no segment embeddings, and its
+single pooled vector comes straight from the embedding bag.
+
+### Verified predictions
+
+Measured in Python (`tools/probe_semantics.py`) and again on the emulator:
+
+| Input | Predicted | Confidence |
+|---|---|---|
+| `heavy traffic jam on the highway` | traffic | 0.914 |
+| `fire accident rescue needed ambulance` | emergency | 0.999 |
+| `street food festival weekend park` | event | 0.477 |
+| `garbage pile streetlight pothole water` | civic | 0.669 |
+| `hello anyone from the block thanks` | general | 0.729 |
+
+### Honest reporting
+
+The banner at the top of the feed is derived from the loaded model's own
+signature, never from a hard-coded string. If the model is unavailable it
+distinguishes the cause:
+
+- `MISSING_ASSET` — an asset is not in the APK
+- `INITIALIZATION_FAILED` — the interpreter could not be built
+- `INFERENCE_FAILED` — the model loaded but a call threw
+
+Each post also stores `classifiedBy`, so a row labelled years ago still reports
+the engine that actually produced it.
+
+### Regenerating a genuine MobileBERT model
+
+> [!WARNING]
+> **This has not been run.** No MobileBERT assets are bundled, and none were
+> invented. If you want a real transformer, this is the recipe — but you must
+> execute it yourself and re-verify, because the current app loader is built
+> for the embedding model.
+>
+> `tools/train_locup_classifier.py` and `tools/train_locup_classifier.ipynb`
+> describe a MobileBERT fine-tune, but **neither produced the shipped file**.
+> Treat them as a starting point, not a verified pipeline.
+
+1. Fine-tune `google/mobilebert-uncased` on your labelled posts.
+2. Export with `TFLiteConverter.from_keras_model(model)` (no quantisation, or
+   full-integer quantisation if you re-verify accuracy).
+3. Confirm **three** int32 inputs `[1, MAX_SEQ_LEN]` and one float output.
+4. Ship `vocab.txt` (`[PAD]`/`[UNK]`/`[CLS]`/`[SEP]`), `labels.txt`, and
+   `max_seq_len.txt`.
+5. Replace `VocabTokenizer` with a WordPiece tokenizer and switch the inference
+   call from `runSignature` to a three-input path.
+6. Re-run `tools/inspect_model.py` and update the table above.
 
 ---
 
-## Run inference on the device
+## Architecture
 
-`PostClassifierRepository` is the single entry point. It owns
-`TfliteTextClassifier` (real MobileBERT) and `LocalClassifier` (keyword
-fallback) and picks at call time.
-
-```kotlin
-class BertTokenizer(vocab: Map<String, Int>, maxSeqLen: Int) {
-    fun basicTokenize(text: String): List<String> {
-        val normalized = Normalizer.normalize(text, Normalizer.Form.NFKD)
-            .lowercase()
-            .replace("\\p{InCombiningDiacriticalMarks}+".toRegex(), "")
-        // BERT's basic tokenizer regex: contractions, words, numbers,
-        // punctuation, whitespace.
-        return BASIC_TOKEN_PATTERN.matcher(normalized).run {
-            buildList { while (find()) append(group().trim()) }
-        }
-    }
-
-    fun wordpiece(token: String): List<String> =
-        // Greedy longest-match against the loaded vocab, ## continuation
-        // prefix for sub-segments. UNK if no match.
-        ...
-
-    fun encode(text: String): TokenizedInput {
-        val pieces = basicTokenize(text).flatMap(::wordpiece).take(maxSeqLen - 2)
-        // Wrap with [CLS] / [SEP], pad to maxSeqLen, return input_ids +
-        // attention_mask (token_type_ids are all zeros).
-        ...
-    }
-}
-
-val t = loaded.tokenizer.encode(text)
-val inputIds      = Array(1) { t.inputIds }
-val attentionMask = Array(1) { t.attentionMask }
-val tokenTypeIds  = Array(1) { IntArray(MAX_SEQ_LEN) }   // single sentence
-val output        = Array(1) { FloatArray(5) }
-interpreter.run(
-    mapOf("input_ids" to inputIds,
-          "attention_mask" to attentionMask,
-          "token_type_ids" to tokenTypeIds),
-    mapOf("classifier" to output),
-)
-```
-
-Loading uses `context.assets.openFd()` → `FileChannel.map()` → a
-memory-mapped `MappedByteBuffer`, so first-inference start-up is
-essentially free. If any of the four assets is missing the model
-returns `null` from `tryLoad()` and the repository falls back to the
-keyword scorer — banner turns green when the real path is active.
-
----
-
-## Skills demonstrated
-
-**Android**
-
-- Jetpack Compose UI with Material 3 (bottom-sheet composer, live
-  probability bars, in-feed chips)
-- Room persistence for posts + subscriptions
-- AOSP `LocationManager` (no Google Play Services dependency)
-- Manual dependency wiring (no DI framework, no Hilt)
-
-**AI / ML**
-
-- End-to-end on-device transformer inference — CSV → HuggingFace
-  fine-tune → `TFLiteConverter` with dynamic-range quantisation →
-  APK assets → in-app `Interpreter`
-- MobileBERT (`google/mobilebert-uncased`) fine-tuned for 5 epochs
-  at lr=2e-5 on a custom 5-class dataset
-- `TFLiteConverter` with **`tf.lite.Optimize.DEFAULT`** for
-  ~4× model size reduction
-- 3-input TFLite graph (`input_ids`, `attention_mask`,
-  `token_type_ids`) read directly via `Interpreter.run(...)`
-- Hand-rolled **WordPiece tokenizer in Kotlin** that mirrors the
-  Python `AutoTokenizer` rules exactly:
-  - NFKD Unicode normalisation + accent stripping
-  - BERT's basic-tokenizer regex (contractions, words, numbers,
-    punctuation)
-  - Greedy longest-match-first WordPiece with `##` continuation
-    prefixes
-  - `[CLS]` / `[SEP]` wrapping and `[PAD]` padding
-- TFLite `Interpreter` loaded via memory-mapped `FileChannel.map()`
-- Graceful fallback to a deterministic keyword scorer when the TFLite
-  assets are missing
-
----
-
-## Build & test
-
-```bash
-./gradlew assembleDebug
-./gradlew test
-```
-
-APK lands in `app/build/outputs/apk/debug/`. The model file is ~25 MB
-(dynamic-range quantised), so the APK is correspondingly larger than
-a typical tiny demo. Tests cover `Cluster.idFor` geo-bucketing, the
-`KeywordFallback` scorer, and the `BertTokenizer` rules.
-
-To regenerate the model:
-
-**Option A — Colab notebook (recommended)**:
-
-Open [tools/train_locup_classifier.ipynb](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.ipynb)
-in Colab, switch to a T4 GPU runtime, run all cells. The last cell
-downloads a `locup_assets.zip` containing the four assets. Unzip
-into `app/src/main/assets/` (and delete the old `vocab.json` if present).
-
-**Option B — Command line**:
-
-```bash
-pip install transformers tensorflow
-python tools/train_locup_classifier.py
-```
-
-## Permissions
-
-- `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` — attach the
-  current `Cluster.id` to a new post (declined permits fall back to a
-  demo Bengaluru coordinate).
-- `INTERNET` — declared for completeness; **the app does not network
-  out**.
-
----
-
-## Repo layout
+Packages inside the single `app` module — a modular split would be ceremony at
+this size.
 
 ```
-app/src/main/java/com/locup/mvp
-├── MainActivity.kt                            # wires LocationProvider + classifier + repo + Compose tree
-├── classifier/
-│   ├── PostClassifierRepository.kt             # single entry point: real model or fallback
-│   ├── TfliteTextClassifier.kt                 # TFLite Interpreter + 3-input wiring
-│   └── BertTokenizer.kt                        # WordPiece tokenizer, mirrors Python AutoTokenizer
-├── ml/
-│   ├── LocalClassifier.kt                     # TFLite wrapper used by the fallback path
-│   └── KeywordFallback.kt                     # deterministic hash-BoW scorer
-├── model/
-│   ├── Post.kt                                # Cluster.idFor(lat, lon) ~1km grid bucket
-│   └── LocationProvider.kt                    # AOSP LocationManager wrapper
-├── repo/
-│   ├── LocUpRepository.kt                     # facade over DAOs + classifier
-│   └── LandmarkRepository.kt                  # lat/lon -> "Near {area}" label
+com.locup.mvp
+├── domain/                  ← pure Kotlin, no Android, no Room
+│   ├── model/               Post, Subscription, GeoPoint, Cluster,
+│   │                        PostCategory, InferenceEngine
+│   ├── repository/          PostRepository, SubscriptionRepository,
+│   │                        TextClassifier, LandmarkResolver  (interfaces)
+│   └── usecase/             ObserveFeed, PublishPost
 ├── data/
-│   ├── TownTalkDatabase.kt                    # Room DB (posts + subscriptions)
-│   ├── entity/                                # PostEntity, SubscriptionEntity
-│   └── dao/                                   # PostDao, SubscriptionDao
-└── ui/
-    └── LocUpApp.kt                            # Scaffold + feed + ComposeSheet + filter chips
+│   ├── ai/                  TfliteEmbeddingClassifier, ClassifierAssets,
+│   │                        VocabTokenizer, KeywordScorer
+│   ├── repository/          RoomPostRepository, RoomSubscriptionRepository
+│   ├── entity/ dao/         Room entities, DAOs, database + migration
+├── presentation/
+│   ├── feed/                FeedScreen (stateless), FeedViewModel, UI state
+│   ├── compose/             ComposerSheet (stateless)
+│   ├── theme/               TownTalkTheme
+│   └── FeedViewModelFactory
+├── platform/location/       AndroidLocationProvider (AOSP LocationManager)
+└── di/                      AppContainer — manual constructor injection
 ```
 
-Training script: [`tools/train_locup_classifier.py`](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.py)
-+ Colab notebook: [`tools/train_locup_classifier.ipynb`](file:///C:/RAKESH/WORK/Development/LocUp/towntalk/tools/train_locup_classifier.ipynb).
+**Key decisions**
+
+- **Domain is dependency-free.** Repository *interfaces* live in `domain`;
+  Room/TFLite implementations live in `data`. The dependency arrow points
+  inward.
+- **One `StateFlow` of one immutable data class** per screen. Separate flows
+  would let the UI observe a half-updated state (new filter, stale posts).
+- **Stateless Composables.** Screens take state and emit lambdas, so they are
+  previewable and testable without a ViewModel.
+- **Manual DI, not Hilt.** The graph is small and fully constructor-injected;
+  a framework would add build cost and indirection without removing coupling.
+- **`INTERNET` permission is deliberately absent**, which makes the offline
+  claim verifiable rather than aspirational.
+
+### Coroutines
+
+| Concern | Approach |
+|---|---|
+| User actions | `viewModelScope` |
+| Model load / tokenize / infer | injected background dispatcher |
+| Live preview | `debounce(250ms)` → `flatMapLatest` → `map` |
+| Stale results | `flatMapLatest` cancels the in-flight job |
+| `Interpreter` (not thread-safe) | serialised on a `ReentrantLock` |
+| Cancellation | `CancellationException` rethrown, never swallowed |
+| Publish | duplicate guard, draft retained on failure, sheet dismissed only on success |
+
+The preview pipeline is derived from state rather than pushed through a
+`SharedFlow`. An earlier revision used `tryEmit`, which **silently drops**
+values when no collector is subscribed — a bug this refactor removed.
 
 ---
 
-## License
+## Build and run
 
-MIT.
+**Requirements:** JDK 17, Android SDK with API 34, an emulator or device on
+API 24+.
+
+```bash
+# from Android Studio: just press Run
+# or:
+.\gradlew.bat :app:assembleDebug
+adb install -r -t app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.locup.mvp/.MainActivity
+```
+
+### Verified commands
+
+| Command | Result |
+|---|---|
+| `.\gradlew.bat :app:assembleDebug` | ✅ BUILD SUCCESSFUL |
+| `.\gradlew.bat :app:testDebugUnitTest` | ✅ 48 tests, 0 failures |
+| `.\gradlew.bat :app:lintDebug` | ✅ 0 errors (21 warnings) |
+| `.\gradlew.bat :app:connectedDebugAndroidTest` | ⚠️ no instrumented tests remain — see below |
+
+Test breakdown: `FeedViewModelTest` 17, `VocabTokenizerTest` 11,
+`KeywordScorerTest` 10, `ClusterTest` 6, `TableLandmarkResolverTest` 4.
+
+> [!NOTE]
+> **Instrumented tests were removed.** The old
+> `TfliteTextClassifierInstrumentedTest` asserted a MobileBERT contract that
+> the bundled model does not have, so it could only ever have been skipped or
+> failing. The model's behaviour is instead verified two ways: via
+> `tools/probe_semantics.py` (exact, reproducible) and manually on the
+> emulator. Adding a genuine instrumented test for the current contract is
+> the obvious next step.
+
+### Toolchain note
+
+`gradlew.bat` clears `ANDROID_PREFS_ROOT` before invoking Gradle. On machines
+where both `ANDROID_PREFS_ROOT` and `ANDROID_USER_HOME` are exported, AGP
+refuses to start with *"Several environment variables ... contain different
+paths to the Android Preferences folder"*. Unsetting the deprecated variable is
+the documented remedy.
+
+---
+
+## Demo walkthrough
+
+See [DEMO_WALKTHROUGH.md](DEMO_WALKTHROUGH.md) for a 3–5 minute script.
+
+---
+
+## Limitations
+
+- **Not MobileBERT.** See the model section — this is the honest state.
+- **Vocabulary is Hinglish-contaminated** (`hai`, `mein`, `ki`, `gaya`). The
+  model was evidently trained on real local posts, so these are legitimate
+  in-vocabulary tokens, but English-only input is better served.
+- **No instrumented test for the live model** (see above).
+- **Landmark table is a hardcoded list** of six Bengaluru areas; anything else
+  falls back to grid coordinates.
+- **Voting is not idempotent per user** — the demo increments a counter with no
+  identity to deduplicate against.
+- **Single-module** by design; not intended as a template for large teams.

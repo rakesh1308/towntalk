@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">LocUp MVP</string>
+    <!-- Visible app name. The applicationId stays com.locup.mvp so existing
+         installs and Room databases keep working. -->
+    <string name="app_name">TownTalk</string>
 </resources>

@@ -2,15 +2,28 @@ package com.locup.mvp.data.entity
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import com.locup.mvp.domain.model.Subscription
 
 /**
- * A 1km cluster the user has subscribed to. The MVP keeps just the
- * cluster id (e.g. "c_1297_3953") and a human-readable label captured
- * at the moment of subscription.
+ * A ~1 km cluster the user has subscribed to.
+ *
+ * Stores only the cluster id plus a label captured at subscribe time: the
+ * label is a convenience for display, and re-deriving it later would make a
+ * subscription silently change meaning when the landmark table changes.
  */
 @Entity(tableName = "subscriptions")
 data class SubscriptionEntity(
     @PrimaryKey val clusterId: String,
     val label: String,
-    val subscribedAt: Long
-)
+    val subscribedAt: Long,
+) {
+    fun toDomain(): Subscription = Subscription(clusterId, label, subscribedAt)
+
+    companion object {
+        fun fromDomain(subscription: Subscription): SubscriptionEntity = SubscriptionEntity(
+            clusterId = subscription.clusterId,
+            label = subscription.label,
+            subscribedAt = subscription.subscribedAt,
+        )
+    }
+}
