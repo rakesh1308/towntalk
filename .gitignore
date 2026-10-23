@@ -17,3 +17,6 @@ local.properties
 
 # IDE agent working directories (local plans/scratch, not project source)
 .artifacts/
+
+# Local screen-recording output (demo artefacts, not source)
+recordings/
