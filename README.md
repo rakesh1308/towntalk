@@ -171,7 +171,7 @@ com.locup.mvp
 | User actions | `viewModelScope` |
 | Model load / tokenize / infer | injected background dispatcher |
 | Live preview | `debounce(250ms)` → `flatMapLatest` → `map` |
-| Stale results | `flatMapLatest` cancels the in-flight job |
+| Stale results | `flatMapLatest` discards an outdated result before it can update state |
 | `Interpreter` (not thread-safe) | serialised on a `ReentrantLock` |
 | Cancellation | `CancellationException` rethrown, never swallowed |
 | Publish | duplicate guard, draft retained on failure, sheet dismissed only on success |
@@ -202,19 +202,24 @@ adb shell am start -n com.locup.mvp/.MainActivity
 | `.\gradlew.bat :app:assembleDebug` | ✅ BUILD SUCCESSFUL |
 | `.\gradlew.bat :app:testDebugUnitTest` | ✅ 48 tests, 0 failures |
 | `.\gradlew.bat :app:lintDebug` | ✅ 0 errors (21 warnings) |
-| `.\gradlew.bat :app:connectedDebugAndroidTest` | ⚠️ no instrumented tests remain — see below |
+| `.\gradlew.bat :app:connectedDebugAndroidTest` | ✅ 4 tests, 0 failures (emulator) |
 
 Test breakdown: `FeedViewModelTest` 17, `VocabTokenizerTest` 11,
 `KeywordScorerTest` 10, `ClusterTest` 6, `TableLandmarkResolverTest` 4.
+Instrumented: `TfliteEmbeddingClassifierInstrumentedTest` 4.
 
 > [!NOTE]
-> **Instrumented tests were removed.** The old
+> **Instrumented tests now cover the real model.** The old
 > `TfliteTextClassifierInstrumentedTest` asserted a MobileBERT contract that
 > the bundled model does not have, so it could only ever have been skipped or
-> failing. The model's behaviour is instead verified two ways: via
-> `tools/probe_semantics.py` (exact, reproducible) and manually on the
-> emulator. Adding a genuine instrumented test for the current contract is
-> the obvious next step.
+> failing; it was removed. Its replacement,
+> `TfliteEmbeddingClassifierInstrumentedTest`, asserts the *actual* contract
+> of the bundled model: the real engine is reported, the model discriminates
+> Traffic from Emergency correctly, concurrent `classify()` calls are
+> serialised safely, and `classify()` after `close()` degrades to keyword
+> scoring instead of crashing. The model's behaviour is therefore verified
+> three ways: via `tools/probe_semantics.py` (exact, reproducible), by the
+> instrumented test on a device, and manually on the emulator.
 
 ### Toolchain note
 
@@ -228,7 +233,11 @@ the documented remedy.
 
 ## Demo walkthrough
 
-See [DEMO_WALKTHROUGH.md](DEMO_WALKTHROUGH.md) for a 3–5 minute script.
+- [DEMO_WALKTHROUGH.md](DEMO_WALKTHROUGH.md) — the 4–5 minute recording script,
+  including the exact wording to use and the phrases to avoid.
+- [APPLICATION_ANSWERS.md](APPLICATION_ANSWERS.md) — paste-ready answers to a
+  job application's questions, a verified-claims table, and a drop-in
+  correction for any résumé line that still calls the model MobileBERT.
 
 ---
 
@@ -238,7 +247,8 @@ See [DEMO_WALKTHROUGH.md](DEMO_WALKTHROUGH.md) for a 3–5 minute script.
 - **Vocabulary is Hinglish-contaminated** (`hai`, `mein`, `ki`, `gaya`). The
   model was evidently trained on real local posts, so these are legitimate
   in-vocabulary tokens, but English-only input is better served.
-- **No instrumented test for the live model** (see above).
+- **The live model is only exercised on a device/emulator** — the JVM unit
+  tests cannot run the TFLite interpreter (see above).
 - **Landmark table is a hardcoded list** of six Bengaluru areas; anything else
   falls back to grid coordinates.
 - **Voting is not idempotent per user** — the demo increments a counter with no

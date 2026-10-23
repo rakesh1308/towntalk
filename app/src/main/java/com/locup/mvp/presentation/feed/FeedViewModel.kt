@@ -40,10 +40,17 @@ import kotlinx.coroutines.withContext
  *   nothing in this class touches disk, Room, or TFLite on the main thread.
  * - The preview is a single pipeline: `text -> debounce -> flatMapLatest -> map`.
  *   `flatMapLatest` is what guarantees a slow classification for old text
- *   cannot overwrite a newer result: the in-flight job for the previous text
- *   is cancelled the moment new text arrives, and the classification itself
- *   runs inside `map`, whose upstream context was already switched, so a
- *   cancelled classification never reaches `_composer`.
+ *   cannot overwrite a newer result: when new text arrives the previous
+ *   text's job is cancelled, and because the classification runs inside
+ *   `map` — a suspend transform — an outdated **result is discarded** and
+ *   never reaches `_composer`.
+ * - Cancellation is cooperative and is only observed at a suspension point.
+ *   `classifier.classify()` is a **blocking** native call executed inside
+ *   `withContext`, so the native inference itself is *not* interrupted
+ *   mid-flight: it runs to completion in the background. The guarantee
+ *   `flatMapLatest` provides is about the *outcome* — the outdated result is
+ *   dropped instead of being written to UI state — not about aborting the
+ *   native work.
  * - [onCleared] closes the classifier so native resources are released with the
  *   screen rather than leaking for the life of the process.
  */
@@ -169,11 +176,14 @@ class FeedViewModel(
      * a preview typed early in the composer's life silently never appears.
      * Deriving from state removes that failure mode entirely.
      *
-     * `debounce` skips intermediate keystrokes; `flatMapLatest` cancels an
-     * in-flight classification the instant newer text arrives, so a slow
-     * result for older text can never overwrite a newer one. The blocking
+     * `debounce` skips intermediate keystrokes. The blocking
      * `classifier.classify` call sits inside `map` — a suspend transform — so
-     * it is both cancellable and off the main thread.
+     * it runs off the main thread. `flatMapLatest` discards the result if
+     * newer text has since arrived, so a slow result for older text can never
+     * overwrite a newer one. The blocking native call itself is **not**
+     * interrupted mid-flight: cancellation is cooperative and is only
+     * observed at a suspension point, so the inference runs to completion in
+     * the background and it is its *result* that gets thrown away.
      *
      * The banner is refreshed alongside each preview because the classifier
      * loads its model **lazily**: the engine only becomes "real" on the first

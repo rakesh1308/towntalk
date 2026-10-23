@@ -14,3 +14,6 @@ local.properties
 
 # But always keep the shipped model
 !app/src/main/assets/*.tflite
+
+# IDE agent working directories (local plans/scratch, not project source)
+.artifacts/

@@ -15,6 +15,12 @@ android {
         versionCode = 1
         versionName = "1.0"
         vectorDrawables { useSupportLibrary = true }
+        // Required for `connectedDebugAndroidTest`: without it AGP falls back
+        // to the legacy `android.test.InstrumentationTestRunner`, whose JUnit3
+        // discovery scans the whole APK for test classes. On a large debug
+        // APK that scan outlives the process-start timeout and the test
+        // process is ANR-killed before a single test runs.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {

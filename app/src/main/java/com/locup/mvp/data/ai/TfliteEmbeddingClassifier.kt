@@ -37,7 +37,17 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * ## Threading
  *
- * [Interpreter] is not thread-safe, so every call is serialised on [lock].
+ * [Interpreter] is explicitly **not** thread-safe, so every call into it is
+ * serialised on [lock]. The lock is taken by the methods that actually touch
+ * the interpreter: [load] and [close], and — after the fix that made this
+ * class safe under concurrent use — [infer] itself, which now holds [lock]
+ * across the native call *and* across the read of the output buffer that
+ * native call fills.
+ *
+ * [infer] therefore acquires the lock itself: callers must not hold it, and
+ * must not try to. Two concurrent [classify] calls can no longer enter
+ * [Interpreter.runSignature] on the same interpreter at the same time.
+ *
  * [classify] and [status] are blocking and must be called off the main thread;
  * the ViewModel owns the dispatcher choice.
  *
@@ -105,7 +115,10 @@ class TfliteEmbeddingClassifier(context: Context) : TextClassifier {
         if (loaded == null) return KeywordScorer.classify(text)
 
         return try {
-            infer(loaded, text)
+            // `infer()` returns null only when the classifier was closed
+            // while this call was waiting for the lock. Fall back to keyword
+            // scoring so the composer keeps responding instead of crashing.
+            infer(loaded, text) ?: KeywordScorer.classify(text)
         } catch (t: Throwable) {
             // The model is present but the call failed: record why, then fall
             // back so the composer keeps responding.
@@ -223,34 +236,61 @@ class TfliteEmbeddingClassifier(context: Context) : TextClassifier {
         return inputs[0] to outputs[0]
     }
 
-    /** One inference. Caller must hold [lock]. */
-    private fun infer(loaded: LoadedEngine, text: String): Classification {
+    /**
+     * Runs one inference.
+     *
+     * This method **acquires [lock] itself** — callers must not hold it.
+     * The reason is [Interpreter]: it is explicitly not thread-safe, so two
+     * concurrent [classify] calls must not be able to be inside
+     * [Interpreter.runSignature] on the same interpreter at the same time.
+     * The lock is therefore held across the native call *and* across the read
+     * of `output[0]`, which is the buffer the native side writes into — reading
+     * it outside the lock would still be a data race.
+     *
+     * Tokenisation happens before the lock is taken: [VocabTokenizer] is
+     * immutable and thread-safe, so there is no reason to serialise it.
+     *
+     * Returns `null` when the classifier was closed while this call was
+     * waiting for the lock — [close] releases the interpreter, so calling
+     * into it afterwards would crash. The caller is expected to fall back to
+     * keyword scoring.
+     *
+     * This is a plain, non-suspending function, so the lock can never be held
+     * across a suspension point.
+     */
+    private fun infer(loaded: LoadedEngine, text: String): Classification? {
         val ids = loaded.tokenizer.encode(text)
         val output = Array(1) { FloatArray(loaded.outputWidth) }
 
-        // Resolve by signature name rather than by tensor index, so the call
-        // keeps working if a future export adds or reorders inputs.
-        loaded.interpreter.runSignature(
-            mapOf(loaded.inputName to arrayOf(ids)),
-            mapOf(loaded.outputName to output),
-            SIGNATURE_KEY,
-        )
+        return lock.withLock {
+            // `close()` may have released the interpreter while this caller
+            // was queueing for the lock.
+            if (closed) return@withLock null
 
-        val raw = output[0]
-        // The head is softmax, but normalise defensively so a future
-        // logits-only export still yields a usable confidence.
-        val total = raw.sum()
-        val scores = loaded.labels.indices.associate { i ->
-            loaded.labels[i] to (if (total > 0f) raw[i] / total else 0f)
+            // Resolve by signature name rather than by tensor index, so the call
+            // keeps working if a future export adds or reorders inputs.
+            loaded.interpreter.runSignature(
+                mapOf(loaded.inputName to arrayOf(ids)),
+                mapOf(loaded.outputName to output),
+                SIGNATURE_KEY,
+            )
+
+            val raw = output[0]
+            // The head is softmax, but normalise defensively so a future
+            // logits-only export still yields a usable confidence.
+            val total = raw.sum()
+            val scores = loaded.labels.indices.associate { i ->
+                loaded.labels[i] to (if (total > 0f) raw[i] / total else 0f)
+            }
+            val topIndex = raw.indices.maxByOrNull { raw[it] } ?: 0
+
+            Classification(
+                topCategory = loaded.labels[topIndex],
+                confidence = scores.getValue(loaded.labels[topIndex]),
+                scores = scores,
+                engine = InferenceEngine.TfliteEmbeddingClassifier,
+            )
         }
-        val topIndex = raw.indices.maxByOrNull { raw[it] } ?: 0
-
-        return Classification(
-            topCategory = loaded.labels[topIndex],
-            confidence = scores.getValue(loaded.labels[topIndex]),
-            scores = scores,
-            engine = InferenceEngine.TfliteEmbeddingClassifier,
-        )
     }
 
     companion object {
